@@ -1,0 +1,177 @@
+---
+title: "BPS Corner Stops Exercise"
+format:
+  html:
+    theme: flatly
+    code-fold: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+# Loading packages
+library(tidyverse)
+library(sf)
+library(kableExtra)
+library(leaflet)
+
+# Loading data
+zum_data <- read_csv("SampleZumExport.csv")
+neighborhood_boundaries <- st_read("boston_neighborhood_boundaries.geojson.json", quiet = TRUE)
+```
+
+## Overview
+
+I chose to complete the Corner Stops technical exercise. This exercise combines Zum export data on bus routes with spatial data that defines Boston neighborhood boundaries. There are two deliverables:
+
+1.  A summary table of the largest corner stops by neighborhood
+
+2.  A map of the 50 largest corner stops
+
+In addition to these deliverables, I will provide justification for some of the decisions and assumptions that I made.
+
+## Assumptions and Decisions
+
+```{r}
+# Summarizing bus stops by AM/PM bell times, excluding actual school buildings
+stop_summary <- zum_data %>%
+  # Reshaping data to long format to more easily identify AM/PM via bell times
+  pivot_longer(
+    cols = c(
+      `Bell Time - Mo`:`Bell Time - Fr`,
+      `Event Time - Mo`:`Event Time - Fr`
+    ),
+    names_to = c(".value", "day"),
+    names_pattern = "(Bell Time|Event Time) - (Mo|Tu|We|Th|Fr)"
+  ) %>%
+  # Dropping rows with missing event times
+  filter(!is.na(`Event Time`)) %>%
+  # Group by unique stop locations
+  group_by(
+    `Event Address`, `Event lat`, `Event lng`, `Is Campus`
+  ) %>%
+  #Aggregate student and school counts by AM/PM bell times
+  summarize(
+    total_students = n_distinct(`Student ID`),
+    morning_students = n_distinct(`Student ID`[hour(`Bell Time`) < 12]),
+    afternoon_students = n_distinct(`Student ID`[hour(`Bell Time`) >= 12]),
+    total_schools = n_distinct(`School Name`),
+    morning_schools = n_distinct(`School Name`[hour(`Bell Time`) < 12]),
+    afternoon_schools = n_distinct(`School Name`[hour(`Bell Time`) >= 12]),
+    .groups = "drop"
+  ) %>%
+  # Not interested in schools as stops themselves
+  filter(`Is Campus` == FALSE)
+
+# Finding stops with multiple lat/lng
+# zum_data %>% select(`Event Address`, `Event lat`, `Event lng`) %>% unique() %>% group_by(`Event Address`) %>% summarize(n = n()) %>% filter(n>1)
+
+```
+
+- Size of stop is measured by the number of distinct students serviced by the stop
+
+- Campus stops were excluded, as the analysis is focused on corner stops
+
+- Corner stops were grouped by latitude and longitude coordinates in addition to address. There were three instances where the same stop had multiple coordinates, and these were treated as separate stops
+
+- I defined morning/afternoon (AM/PM) using bell times (before noon vs noon or later)
+
+- Records with missing Event Times were excluded because they represent days where the stop was not serviced
+
+## Top Stop By Neighborhood
+
+The table below shows the largest stop in each neighborhood in Boston. This includes the number of unique students served, the percentage of total neighborhood stop assignments that the stop represents, the number of students served in the morning and afternoon, and the number of unique schools serviced by the stop.
+
+```{r}
+# Using long/lat coordinates to create sf object
+stops_sf <- stop_summary %>%
+  st_as_sf(coords = c("Event lng", "Event lat"), crs = 4326)
+
+# Join didn't work initially, so fixing
+neighborhood_boundaries_fixed <- st_make_valid(neighborhood_boundaries)
+
+# Spatial join between stops_sf and neighborhood boundaries
+stops_with_neighborhoods <- st_join(stops_sf, neighborhood_boundaries_fixed, join = st_intersects)
+
+# Creating summary table with top stop per neighborhood
+top_neighborhood_stops <- stops_with_neighborhoods %>%
+  # Getting rid of geometry column
+  st_drop_geometry() %>%
+  group_by(name) %>%
+  # Also calculating percentage of total neighborhood assignments per stop
+  mutate(neighborhood_total_students = sum(total_students)) %>%
+  slice_max(total_students, n = 1) %>%
+  mutate(pct_neighborhood_students = paste0(round(total_students/neighborhood_total_students, 2)*100, "%")) %>%
+  select(neighborhood = `name`, `Event Address`, `total_students`, 
+         `pct_neighborhood_students`,  
+         `morning_students`, `afternoon_students`, 
+         `total_schools`, `morning_schools`, `afternoon_schools`) %>%
+  arrange(desc(total_students))
+
+top_neighborhood_stops %>%
+  kbl(col.names = c("Neighborhood", "Stop Address", "Students", "Neighborhood Percent", "Students (AM)", "Students (PM)", "Schools Serviced", "Schools (AM)", "Schools (PM)"),
+      caption = "Largest Corner Stop by Boston Neighborhood",
+      align = c("l", "l", "r", "r", "r", "r", "r", "r", "r"))
+  
+
+
+```
+
+## Mapping Top 50 Stops
+
+Below is a map of the 50 largest stops by unique students. The size of each circle scales with the size of the stop, and more information is available by hovering each stop.
+
+```{r}
+# Selecting the top 50 stops
+top_50_stops <- stops_with_neighborhoods %>%
+  group_by(name) %>%
+  # Calculating percent of neighborhood students, like above
+  mutate(neighborhood_total_students = sum(total_students),
+         pct_neighborhood_students = 
+           round(total_students/neighborhood_total_students, 2) * 100) %>%
+  ungroup() %>%
+  arrange(desc(total_students)) %>%
+  # Only keeping the 50 largest stops
+  head(50) %>% 
+  # Creating the caption here for the map
+  mutate(
+    caption = paste0(
+      "<b>Stop:</b> ",`Event Address`, "<br>",
+      "<b>Students (AM/PM): </b>", `total_students`, " ", "(", 
+      morning_students, "/", afternoon_students, ")",  "<br>",
+      "<b>Percent of Neighborhood:</b> ", pct_neighborhood_students, "%"
+    )
+  )
+
+
+# Create leaflet map
+leaflet(top_50_stops) %>%
+  # Using standard OpenStreetMap tiles
+  addTiles(
+    # Setting the minimum zoom so you can't zoom all the way out
+    options = tileOptions(minZoom = 11)
+  ) %>%
+  # Adding neighborhood boundaries first
+  addPolygons(data = neighborhood_boundaries_fixed,
+              color = "#1d3557",
+              fillColor = "#286eb7",
+              fillOpacity = 0.3,
+              label = ~name) %>%
+  # Adding markers for each stop
+  addCircleMarkers(
+    color = "#A6192E",
+    stroke = FALSE,
+    fillOpacity = 0.8,
+    # Size of circle is a function of students serviced
+    radius = ~sqrt(total_students)*0.8,
+    label = ~lapply(caption, htmltools::HTML)
+  ) %>%
+  # Adding a title
+  addControl("<h3 style='margin: 0;'>Top BPS Bus Stops</h3>", position = "topright")
+    
+
+
+
+```
